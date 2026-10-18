@@ -8,14 +8,15 @@
  *     as a binding (never while typing in a chat/edit box, never when the
  *     window is unfocused). It records which key strings are currently held.
  *   - CGWorldFrame::OnLayerUpdate runs every frame. For each action button's
- *     bound key that is held and physically down, it *replays* the key press
- *     through the game's own binding dispatch (the original ExecKey).
+ *     bound key that is held and physically down, it calls the client's
+ *     CGActionBar::UseAction on the correct, page-aware slot.
  *
- * Replaying the binding instead of calling UseAction directly means all of the
- * client's action-bar logic is preserved: page 1-6 paging, the bonus bar
- * (stealth / druid shapeshift), and any rebinding (some addons bind action
- * keys to "CLICK <frame>:LeftButton" instead of the plain ACTIONBUTTONn
- * command).
+ * The slot is computed the same way the client's own FrameXML does
+ * (ActionButton_GetPagedID):
+ *   - bonus bar active:  slot = id + (NUM_ACTIONBAR_PAGES + bonusBarOffset - 1) * 12
+ *   - otherwise:         slot = id + currentPage * 12
+ * so page 1-6 paging, warrior stances, stealth, and druid shapeshift bars all
+ * cast the right button.
  */
 #include <windows.h>
 #include <stdint.h>
@@ -33,13 +34,19 @@ static __inline void* va(uintptr_t a) {
 #define VA_CGWorldFrame_OnLayerUpdate    0x004FA040u
 #define VA_CGUIBindings_GetCommandKey    0x0055E750u
 #define VA_CGUIBindings_ExecKey          0x00563150u
+#define VA_CGActionBar_UseAction         0x005ABBC0u
+#define VA_m_currentPage                 0x00C1E598u
+#define VA_m_bonusBarOffset              0x00C1E59Cu
+#define VA_m_tempPageActiveFlags         0x00C1E5A0u
 #define VA_s_bindings                    0x00BEADD8u
 #define VA_FrameScript_RegisterFunction  0x00817F90u
 #define VA_FrameScript_Initialize        0x00819BB0u
 #define VA_lua_pushnumber                0x0084E2A0u
 
 #define BINDING_MODE_ACTIVE 4
-#define NUM_ACTION_BUTTONS  12
+#define NUM_ACTIONBAR_BUTTONS 12
+#define NUM_ACTIONBAR_PAGES   6
+#define NUM_ACTION_BUTTONS  NUM_ACTIONBAR_BUTTONS
 #define CAST_THROTTLE_MS    100
 #define BINDING_REFRESH_MS  1000
 #define MAX_ACTIVE_KEYS     64
@@ -50,11 +57,13 @@ typedef int (*lua_CFunction)(lua_State*);
 typedef void        (__attribute__((thiscall)) *fn_OnLayerUpdate)(void* self, float elapsedSec);
 typedef const char* (__attribute__((thiscall)) *fn_GetCommandKey)(void* self, int mode, const char* command, int index);
 typedef int32_t     (__attribute__((thiscall)) *fn_ExecKey)(void* self, uint32_t modifiers, const char* key, int32_t isDown, int32_t allowPressure, int mode);
+typedef void        (__cdecl *fn_UseAction)(int32_t slot, const void* target, const char* button);
 typedef void        (__cdecl *fn_RegisterFunction)(const char* name, lua_CFunction fn);
 typedef int         (__cdecl *fn_InitSignature)(int32_t profile);
 typedef void        (__cdecl *fn_lua_pushnumber)(lua_State* L, double n);
 
 static fn_GetCommandKey     g_GetCommandKey;
+static fn_UseAction         g_UseAction;
 static fn_RegisterFunction  g_RegisterFunction;
 static fn_lua_pushnumber    g_lua_pushnumber;
 
@@ -107,7 +116,7 @@ static int KeyToVK(const char* key) {
 }
 
 /* ---------------- held-key set (driven by ExecKey) ---------------- */
-typedef struct { char key[24]; uint32_t mods; int mode; } ActiveEntry;
+typedef struct { char key[24]; } ActiveEntry;
 static ActiveEntry g_active[MAX_ACTIVE_KEYS];
 static int g_activeN = 0;
 
@@ -117,12 +126,10 @@ static int ActiveFind(const char* k) {
         if (!lstrcmpiA(g_active[i].key, k)) return i;
     return -1;
 }
-static void ActiveAdd(const char* k, uint32_t mods, int mode) {
+static void ActiveAdd(const char* k) {
     if (!k || !k[0] || ActiveFind(k) >= 0) return;
     if (g_activeN >= MAX_ACTIVE_KEYS) g_activeN = 0;
     lstrcpynA(g_active[g_activeN].key, k, 24);
-    g_active[g_activeN].mods = mods;
-    g_active[g_activeN].mode = mode;
     g_activeN++;
 }
 static void ActiveDel(const char* k) {
@@ -148,9 +155,19 @@ static void ResolveBindings(void) {
     }
 }
 
-static void Replay(const ActiveEntry* e) {
-    void* b = *(void**)va(VA_s_bindings);
-    if (b) g_orig_execkey(b, e->mods, e->key, 1, 0, e->mode);
+/* Slot (0-based) for main-bar button s (0-based), matching
+ * ActionButton_GetPagedID in the client's FrameXML. */
+static int32_t PagedSlot(int s) {
+    int id = s + 1;
+    uint32_t bonus = *(uint32_t*)va(VA_m_bonusBarOffset);
+    uint32_t page  = *(uint32_t*)va(VA_m_currentPage);
+    uint32_t temp  = *(uint32_t*)va(VA_m_tempPageActiveFlags);
+    int slot1;
+    if (bonus)
+        slot1 = id + (NUM_ACTIONBAR_PAGES + (int)bonus - 1) * NUM_ACTIONBAR_BUTTONS;
+    else
+        slot1 = id + (temp ? 0 : (int)page) * NUM_ACTIONBAR_BUTTONS;
+    return slot1 - 1;
 }
 
 static void Tick(void) {
@@ -158,7 +175,7 @@ static void Tick(void) {
     DWORD now = GetTickCount();
 
     if (now - lastResolve >= BINDING_REFRESH_MS) { ResolveBindings(); lastResolve = now; }
-    if (now < nextCast) return;
+    if (g_activeN == 0 || now < nextCast) return;
 
     int busy = 0;
     for (int s = 0; s < NUM_ACTION_BUTTONS; s++) {
@@ -173,10 +190,11 @@ static void Tick(void) {
     if (g_gameWnd && GetForegroundWindow() != g_gameWnd) return;
 
     for (int s = 0; s < NUM_ACTION_BUTTONS; s++) {
-        if (!g_slotKey[s][0]) continue;
-        int idx = ActiveFind(g_slotKey[s]);
-        if (idx >= 0 && (GetAsyncKeyState(g_slotVk[s]) & 0x8000))
-            Replay(&g_active[idx]);
+        if (!g_slotKey[s][0] || ActiveFind(g_slotKey[s]) < 0) continue;
+        if (GetAsyncKeyState(g_slotVk[s]) & 0x8000) {
+            unsigned long long guid = 0;
+            g_UseAction(PagedSlot(s), &guid, NULL);
+        }
     }
     nextCast = now + CAST_THROTTLE_MS;
 }
@@ -187,7 +205,7 @@ static void __attribute__((thiscall)) hook_OnLayerUpdate(void* self, float dt) {
 }
 
 static int32_t __attribute__((thiscall)) hook_ExecKey(void* self, uint32_t modifiers, const char* key, int32_t isDown, int32_t allowPressure, int mode) {
-    if (isDown) ActiveAdd(key, modifiers, mode); else ActiveDel(key);
+    if (isDown) ActiveAdd(key); else ActiveDel(key);
     return g_orig_execkey(self, modifiers, key, isDown, allowPressure, mode);
 }
 
@@ -208,6 +226,7 @@ void HoldToCast_Init(void) {
     htc_log("HoldToCast_Init wowbase=%p", (void*)GetModuleHandleA(NULL));
 
     g_GetCommandKey    = (fn_GetCommandKey)va(VA_CGUIBindings_GetCommandKey);
+    g_UseAction        = (fn_UseAction)va(VA_CGActionBar_UseAction);
     g_RegisterFunction = (fn_RegisterFunction)va(VA_FrameScript_RegisterFunction);
     g_lua_pushnumber   = (fn_lua_pushnumber)va(VA_lua_pushnumber);
 
