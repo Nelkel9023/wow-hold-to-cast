@@ -1,0 +1,17 @@
+# build output
+/build/*
+!/build/build.ps1
+
+# vendored dependencies (not ours)
+/third_party/
+
+# runtime / logs
+*.log
+holdtocast.log
+
+# local zig toolchain
+/tools/
+
+# OS cruft
+Thumbs.db
+desktop.ini

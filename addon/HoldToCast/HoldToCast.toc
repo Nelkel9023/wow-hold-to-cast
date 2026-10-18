@@ -1,0 +1,7 @@
+## Interface: 30300
+## Title: Hold To Cast
+## Notes: Hold an action bar key to keep casting its spell/ability. Notifier for dinput8.dll.
+## Version: 0.2.0
+## Author: AI-assisted (see README)
+## X-Category: Action Bars
+HoldToCast.lua
