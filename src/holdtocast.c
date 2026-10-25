@@ -222,7 +222,8 @@ static void Tick(void) {
         }
         if (g_extraKey[s][0] && ActiveFind(g_extraKey[s]) >= 0) {
             if (GetAsyncKeyState(g_extraVk[s]) & 0x8000) {
-                Replay(g_extraKey[s]);
+                unsigned long long guid2 = 0;
+                g_UseAction(PagedSlot(s), &guid2, NULL);
             }
         }
     }
