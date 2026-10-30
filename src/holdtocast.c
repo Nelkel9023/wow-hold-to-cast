@@ -47,7 +47,8 @@ static __inline void* va(uintptr_t a) {
 #define NUM_ACTIONBAR_BUTTONS 12
 #define NUM_ACTIONBAR_PAGES   6
 #define NUM_ACTION_BUTTONS  NUM_ACTIONBAR_BUTTONS
-#define CAST_THROTTLE_MS    500
+#define NUM_MULTI_BARS      4
+#define CAST_THROTTLE_MS    250
 #define BINDING_REFRESH_MS  1000
 #define MAX_ACTIVE_KEYS     64
 
@@ -139,37 +140,34 @@ static void ActiveDel(const char* k) {
     g_activeN--;
 }
 
-/* Replay a held key through the client's own binding dispatch (for
- * multi-bar actions where page logic differs from the main bar). */
-static void Replay(const char* k) {
-    void* b = *(void**)va(VA_s_bindings);
-    if (b && k) g_orig_execkey(b, 0, k, 1, 0, 4);
-}
-
 /* ---------------- slot -> bound key ---------------- */
-static char g_mainKey[NUM_ACTION_BUTTONS][24];
-static int  g_mainVk[NUM_ACTION_BUTTONS];
-static char g_extraKey[NUM_ACTION_BUTTONS][24];
-static int  g_extraVk[NUM_ACTION_BUTTONS];
-static char g_mainCmd[NUM_ACTION_BUTTONS][24];
-static char g_extraCmd[NUM_ACTION_BUTTONS][24];
+static char g_slotKey[NUM_ACTION_BUTTONS][24];
+static int  g_slotVk[NUM_ACTION_BUTTONS];
+static char g_multiKey[NUM_MULTI_BARS][NUM_ACTION_BUTTONS][24];
+static int  g_multiVk[NUM_MULTI_BARS][NUM_ACTION_BUTTONS];
+/* Multi-bars show fixed pages 3-6; base is the 0-based first slot. */
+static const int g_multiBase[NUM_MULTI_BARS] = { 60, 48, 24, 36 };
 static HWND g_gameWnd = NULL;
 
 static void ResolveBindings(void) {
     void* b = *(void**)va(VA_s_bindings);
     if (!b) return;
+    char cmd[40];
     for (int i = 0; i < NUM_ACTION_BUTTONS; i++) {
-        wsprintfA(g_mainCmd[i], "ACTIONBUTTON%d", i + 1);
-        wsprintfA(g_extraCmd[i], "MULTIACTIONBUTTON%d", i + 1);
-        const char* k1 = g_GetCommandKey(b, BINDING_MODE_ACTIVE, g_mainCmd[i], 0);
-        const char* k2 = g_GetCommandKey(b, BINDING_MODE_ACTIVE, g_extraCmd[i], 0);
-        if (k1) { lstrcpynA(g_mainKey[i], k1, 24); g_mainVk[i] = KeyToVK(k1); }
-        else   { g_mainKey[i][0] = 0; g_mainVk[i] = 0; }
-        if (k2) { lstrcpynA(g_extraKey[i], k2, 24); g_extraVk[i] = KeyToVK(k2); }
-        else   { g_extraKey[i][0] = 0; g_extraVk[i] = 0; }
+        wsprintfA(cmd, "ACTIONBUTTON%d", i + 1);
+        const char* k = g_GetCommandKey(b, BINDING_MODE_ACTIVE, cmd, 0);
+        if (k) { lstrcpynA(g_slotKey[i], k, 24); g_slotVk[i] = KeyToVK(k); }
+        else   { g_slotKey[i][0] = 0; g_slotVk[i] = 0; }
+    }
+    for (int bar = 0; bar < NUM_MULTI_BARS; bar++) {
+        for (int i = 0; i < NUM_ACTION_BUTTONS; i++) {
+            wsprintfA(cmd, "MULTIACTIONBAR%dBUTTON%d", bar + 1, i + 1);
+            const char* k = g_GetCommandKey(b, BINDING_MODE_ACTIVE, cmd, 0);
+            if (k) { lstrcpynA(g_multiKey[bar][i], k, 24); g_multiVk[bar][i] = KeyToVK(k); }
+            else   { g_multiKey[bar][i][0] = 0; g_multiVk[bar][i] = 0; }
+        }
     }
 }
-
 /* Slot (0-based) for main-bar button s (0-based), matching
  * ActionButton_GetPagedID in the client's FrameXML. */
 static int32_t PagedSlot(int s) {
@@ -193,40 +191,40 @@ static void Tick(void) {
     if (g_activeN == 0 || now < nextCast) return;
 
     int busy = 0;
-    /* main bar */
     for (int s = 0; s < NUM_ACTION_BUTTONS; s++) {
-        if (!g_mainKey[s][0]) continue;
-        int idx = ActiveFind(g_mainKey[s]);
-        int down = g_mainVk[s] && (GetAsyncKeyState(g_mainVk[s]) & 0x8000);
-        if (idx >= 0 && !down) { ActiveDel(g_mainKey[s]); idx = -1; }
+        if (!g_slotKey[s][0]) continue;
+        int idx = ActiveFind(g_slotKey[s]);
+        int down = g_slotVk[s] && (GetAsyncKeyState(g_slotVk[s]) & 0x8000);
+        if (idx >= 0 && !down) { ActiveDel(g_slotKey[s]); idx = -1; }
         if (idx >= 0) busy = 1;
     }
-    /* extra multi-bars */
-    for (int s = 0; s < NUM_ACTION_BUTTONS; s++) {
-        if (!g_extraKey[s][0]) continue;
-        int idx = ActiveFind(g_extraKey[s]);
-        int down = g_extraVk[s] && (GetAsyncKeyState(g_extraVk[s]) & 0x8000);
-        if (idx >= 0 && !down) { ActiveDel(g_extraKey[s]); idx = -1; }
-        if (idx >= 0) busy = 1;
-    }
+    for (int bar = 0; bar < NUM_MULTI_BARS; bar++)
+        for (int i = 0; i < NUM_ACTION_BUTTONS; i++) {
+            if (!g_multiKey[bar][i][0]) continue;
+            int idx = ActiveFind(g_multiKey[bar][i]);
+            int down = g_multiVk[bar][i] && (GetAsyncKeyState(g_multiVk[bar][i]) & 0x8000);
+            if (idx >= 0 && !down) { ActiveDel(g_multiKey[bar][i]); idx = -1; }
+            if (idx >= 0) busy = 1;
+        }
     if (!busy) return;
     if (!g_gameWnd) g_gameWnd = GetForegroundWindow();
     if (g_gameWnd && GetForegroundWindow() != g_gameWnd) return;
 
     for (int s = 0; s < NUM_ACTION_BUTTONS; s++) {
-        if (g_mainKey[s][0] && ActiveFind(g_mainKey[s]) >= 0) {
-            if (GetAsyncKeyState(g_mainVk[s]) & 0x8000) {
-                unsigned long long guid = 0;
-                g_UseAction(PagedSlot(s), &guid, NULL);
-            }
-        }
-        if (g_extraKey[s][0] && ActiveFind(g_extraKey[s]) >= 0) {
-            if (GetAsyncKeyState(g_extraVk[s]) & 0x8000) {
-                unsigned long long guid2 = 0;
-                g_UseAction(PagedSlot(s), &guid2, NULL);
-            }
+        if (!g_slotKey[s][0]) continue;
+        if (ActiveFind(g_slotKey[s]) >= 0 && (g_slotVk[s] && (GetAsyncKeyState(g_slotVk[s]) & 0x8000))) {
+            unsigned long long guid = 0;
+            g_UseAction(PagedSlot(s), &guid, NULL);
         }
     }
+    for (int bar = 0; bar < NUM_MULTI_BARS; bar++)
+        for (int i = 0; i < NUM_ACTION_BUTTONS; i++) {
+            if (!g_multiKey[bar][i][0]) continue;
+            if (ActiveFind(g_multiKey[bar][i]) >= 0 && (g_multiVk[bar][i] && (GetAsyncKeyState(g_multiVk[bar][i]) & 0x8000))) {
+                unsigned long long guid = 0;
+                g_UseAction(g_multiBase[bar] + i, &guid, NULL);
+            }
+        }
     nextCast = now + CAST_THROTTLE_MS;
 }
 
